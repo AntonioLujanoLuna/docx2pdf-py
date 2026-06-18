@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "docx2pdf-py"
+version = "0.1.0"
+description = "Conversión fiel de .docx a PDF usando solo librerías de Python (lxml + WeasyPrint)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Javier Tejero", email = "javitejerodev@gmail.com" }]
+keywords = ["docx", "pdf", "word", "ooxml", "weasyprint", "conversion"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Office/Business",
+    "Topic :: Text Processing :: Markup",
+]
+dependencies = [
+    "weasyprint>=60",
+    "lxml>=5",
+]
+
+[project.urls]
+Homepage = "https://github.com/javiertejero/docx2pdf-py"
+
+[project.scripts]
+docx2pdf-py = "docx2pdf_py.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["docx2pdf_py"]

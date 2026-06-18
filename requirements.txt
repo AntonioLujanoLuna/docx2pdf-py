@@ -1,0 +1,15 @@
+# Conversión docx -> PDF (solo Python)
+weasyprint==69.0      # motor de maquetación HTML -> PDF (paginación, tablas)
+lxml==6.1.1           # parseo del OOXML (word/document.xml, styles.xml)
+
+# Fuentes métricamente compatibles necesarias para fidelidad visual:
+#   Calibri -> Carlito   |   Georgia -> Gelasio
+# Instálalas en el sistema (se descubren vía fontconfig). Ejemplo sin root:
+#   mkdir -p ~/.local/share/fonts && cd ~/.local/share/fonts
+#   curl -fsSLO https://github.com/google/fonts/raw/main/ofl/carlito/Carlito-Regular.ttf
+#   curl -fsSLO https://github.com/google/fonts/raw/main/ofl/carlito/Carlito-Bold.ttf
+#   curl -fsSLO https://github.com/google/fonts/raw/main/ofl/carlito/Carlito-Italic.ttf
+#   curl -fsSLO https://github.com/google/fonts/raw/main/ofl/carlito/Carlito-BoldItalic.ttf
+#   curl -fsSL "https://github.com/google/fonts/raw/main/ofl/gelasio/Gelasio%5Bwght%5D.ttf" -o Gelasio.ttf
+#   curl -fsSL "https://github.com/google/fonts/raw/main/ofl/gelasio/Gelasio-Italic%5Bwght%5D.ttf" -o Gelasio-Italic.ttf
+#   fc-cache -f

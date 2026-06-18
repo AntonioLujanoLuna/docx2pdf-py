@@ -1,0 +1,16 @@
+# Entorno / build
+.venv/
+venv/
+__pycache__/
+*.pyc
+build/
+dist/
+*.egg-info/
+
+# Documentos de prueba (pueden ser confidenciales) — no subir
+*.docx
+*.pdf
+
+# Salidas / comparaciones
+output.pdf
+comparacion/
