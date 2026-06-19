@@ -150,6 +150,13 @@ GENERIC_FAMILY = {
 BODY_LINE_HEIGHT = float(os.environ.get("BODY_LH", "1.0"))
 CELL_LINE_HEIGHT = float(os.environ.get("CELL_LH", "1.16"))
 
+# Un .docx no guarda páginas fijas: Word las calcula al maquetar. Para acercar
+# la paginación del PDF a la de Word respetamos sus "pistas" de salto de página
+# (<w:lastRenderedPageBreak/>), que Word escribe donde partió la página la última
+# vez que la renderizó. Es una aproximación (puede quedar obsoleta si el .docx se
+# editó sin reabrir en Word); se puede desactivar con RESPECT_PAGE_HINTS=0.
+RESPECT_PAGE_HINTS = os.environ.get("RESPECT_PAGE_HINTS", "1") not in ("0", "false", "off")
+
 
 def font_stack(name: Optional[str]) -> Optional[str]:
     if not name:
@@ -169,8 +176,15 @@ def rpr_dict(rpr) -> dict:
     if rpr is None:
         return d
     fonts = first(rpr, "rFonts")
-    if fonts is not None and attr(fonts, "ascii"):
-        d["font"] = attr(fonts, "ascii")
+    if fonts is not None:
+        if attr(fonts, "ascii"):
+            d["font"] = attr(fonts, "ascii")
+        elif attr(fonts, "asciiTheme"):
+            # fuente de tema (p.ej. minorHAnsi -> Calibri); se resuelve luego
+            # contra theme1.xml. font=None pisa cualquier fuente heredada al
+            # fusionar (la rFonts del run manda sobre la del estilo por defecto).
+            d["font_theme"] = attr(fonts, "asciiTheme")
+            d["font"] = None
     b = on(first(rpr, "b"))
     if b is not None:
         d["bold"] = b
@@ -247,12 +261,21 @@ class Converter:
         self.doc = self._xml_part("word/document.xml")
         self.styles = self._xml_part("word/styles.xml")
         self.rels = self._index_rels()
+        self.theme_fonts = self._index_theme()
+        self.def_rpr, self.def_ppr = self._doc_defaults()
+        self.style_ppr = {}         # styleId -> propiedades de párrafo resueltas
         self.style_rpr = self._index_styles()
         self.num_levels = self._index_numbering()
+        # Por defecto Calibri/10 pt salvo que el documento declare otra cosa en
+        # <w:docDefaults> (fuente, tamaño, color, negrita…), que entonces gana.
         self.default = {"font": "Calibri", "color": "#000000", "size": 10.0}
+        for k in ("font", "size", "color", "bold", "italic"):
+            if k in self.def_rpr and self.def_rpr[k] is not None:
+                self.default[k] = self.def_rpr[k]
         self._img_cache = {}
         self._pending_floats = []   # imágenes flotantes "bloque" tras el bloque
         self._list_counters = {}    # numId -> {ilvl: contador actual}
+        self._content_started = False  # para no partir página antes del 1.er bloque
 
         # cabecera/pie por tipo (default / first / even) según el sectPr
         sect = self.doc.find(w("body")).find(w("sectPr"))
@@ -326,11 +349,113 @@ class Converter:
                     return self._opt("word/" + target)
         return None
 
-    def _index_styles(self) -> dict:
+    # -- tema / valores por defecto / herencia de estilos -----------------
+    def _index_theme(self) -> dict:
+        """{'major': 'Calibri Light', 'minor': 'Calibri'} desde theme1.xml.
+
+        Word suele referirse a las fuentes por tema (asciiTheme="minorHAnsi")
+        en vez de por nombre; el nombre real vive en el esquema de fuentes del
+        tema, así que lo indexamos para resolverlas después.
+        """
+        theme = self._opt("word/theme/theme1.xml")
         out = {}
+        if theme is None:
+            return out
+        for key, tag in (("major", "majorFont"), ("minor", "minorFont")):
+            fs = theme.find(".//" + f"{{{A}}}{tag}")
+            if fs is not None:
+                latin = fs.find(f"{{{A}}}latin")
+                if latin is not None and latin.get("typeface"):
+                    out[key] = latin.get("typeface")
+        return out
+
+    def _resolve_theme_font(self, d: dict) -> None:
+        """Si el dict de formato apunta a una fuente de tema, fija su nombre."""
+        if not d.get("font") and d.get("font_theme"):
+            key = "major" if d["font_theme"].startswith("major") else "minor"
+            name = self.theme_fonts.get(key)
+            if name:
+                d["font"] = name
+
+    def _doc_defaults(self):
+        """Formato por defecto del documento (<w:docDefaults>): (rPr, pPr)."""
+        dd = first(self.styles, "docDefaults")
+        rpr_def, ppr_def = {}, {}
+        if dd is not None:
+            rprd = first(dd, "rPrDefault")
+            if rprd is not None:
+                rpr_def = rpr_dict(first(rprd, "rPr"))
+                self._resolve_theme_font(rpr_def)
+            pprd = first(dd, "pPrDefault")
+            if pprd is not None:
+                ppr_def = self._ppr_layout(first(pprd, "pPr"))
+        return rpr_def, ppr_def
+
+    def _ppr_layout(self, ppr) -> dict:
+        """Propiedades de párrafo heredables (alineación, espaciado, sangría).
+
+        Se extraen como dict para poder fusionar las del estilo (vía basedOn)
+        con las propias del párrafo, igual que hace Word.
+        """
+        p = {}
+        if ppr is None:
+            return p
+        jc = first(ppr, "jc")
+        if jc is not None and attr(jc, "val"):
+            p["align"] = attr(jc, "val")
+        sp = first(ppr, "spacing")
+        if sp is not None:
+            if attr(sp, "before") is not None:
+                p["before"] = attr(sp, "before")
+            if attr(sp, "after") is not None:
+                p["after"] = attr(sp, "after")
+            if attr(sp, "line") is not None and attr(sp, "lineRule") in (None, "auto"):
+                p["line"] = attr(sp, "line")
+        ind = first(ppr, "ind")
+        if ind is not None:
+            for k in ("left", "right", "hanging", "firstLine"):
+                if attr(ind, k) is not None:
+                    p[k] = attr(ind, k)
+        return p
+
+    def _index_styles(self) -> dict:
+        """styleId -> rPr resuelto; rellena self.style_ppr con el pPr resuelto.
+
+        Resuelve la cadena ``w:basedOn`` para que un estilo herede el formato
+        (carácter y párrafo) de su padre, con protección frente a ciclos.
+        """
+        raw = {}
         for st in self.styles.findall(w("style")):
             sid = attr(st, "styleId")
-            out[sid] = rpr_dict(first(st, "rPr"))
+            based = first(st, "basedOn")
+            raw[sid] = {
+                "rpr": rpr_dict(first(st, "rPr")),
+                "ppr": self._ppr_layout(first(st, "pPr")),
+                "based": attr(based, "val") if based is not None else None,
+            }
+
+        resolved = {}
+
+        def resolve(sid, seen):
+            if sid in resolved:
+                return resolved[sid]
+            node = raw.get(sid)
+            if node is None or sid in seen:
+                return {"rpr": {}, "ppr": {}}
+            seen = seen | {sid}
+            parent = (resolve(node["based"], seen) if node["based"]
+                      else {"rpr": {}, "ppr": {}})
+            merged_rpr = dict(parent["rpr"]); merged_rpr.update(node["rpr"])
+            merged_ppr = dict(parent["ppr"]); merged_ppr.update(node["ppr"])
+            resolved[sid] = {"rpr": merged_rpr, "ppr": merged_ppr}
+            return resolved[sid]
+
+        out = {}
+        for sid in raw:
+            r = resolve(sid, set())
+            self._resolve_theme_font(r["rpr"])
+            out[sid] = r["rpr"]
+            self.style_ppr[sid] = r["ppr"]
         return out
 
     def _index_numbering(self) -> dict:
@@ -428,6 +553,7 @@ class Converter:
     def _render_run(self, r, base: dict) -> str:
         d = dict(base)
         d.update(rpr_dict(first(r, "rPr")))
+        self._resolve_theme_font(d)
         chunks = []
         images = []
         for child in r:
@@ -511,41 +637,40 @@ class Converter:
         ppr = first(p, "pPr")
         style_id = None
         base = dict(self.default)
+        layout = dict(self.def_ppr)  # propiedades de párrafo de docDefaults
         if ppr is not None:
             ps = first(ppr, "pStyle")
             style_id = attr(ps, "val") if ps is not None else None
             if style_id and style_id in self.style_rpr:
                 base.update(self.style_rpr[style_id])
+                layout.update(self.style_ppr.get(style_id, {}))
+        self._resolve_theme_font(base)
+        # las propiedades propias del párrafo pisan a las heredadas del estilo
+        layout.update(self._ppr_layout(ppr))
 
         css = []
         num_id = None
         ilvl = 0
-        has_ind = False
+        has_ind = any(k in layout for k in ("left", "right", "hanging", "firstLine"))
+        if layout.get("align"):
+            m = {"both": "justify", "center": "center", "right": "right",
+                 "left": "left", "distribute": "justify"}
+            css.append("text-align:" + m.get(layout["align"], "left"))
+        if "before" in layout:
+            css.append(f"margin-top:{tw_pt(layout['before']):.1f}pt")
+        if "after" in layout:
+            css.append(f"margin-bottom:{tw_pt(layout['after']):.1f}pt")
+        if "line" in layout:
+            css.append(f"line-height:{float(layout['line'])/240.0:.2f}")
+        if layout.get("left"):
+            css.append(f"margin-left:{tw_pt(layout['left']):.1f}pt")
+        if layout.get("right"):
+            css.append(f"margin-right:{tw_pt(layout['right']):.1f}pt")
+        if layout.get("hanging"):
+            css.append(f"text-indent:-{tw_pt(layout['hanging']):.1f}pt")
+        elif layout.get("firstLine"):
+            css.append(f"text-indent:{tw_pt(layout['firstLine']):.1f}pt")
         if ppr is not None:
-            jc = first(ppr, "jc")
-            if jc is not None:
-                m = {"both": "justify", "center": "center", "right": "right", "left": "left"}
-                css.append("text-align:" + m.get(attr(jc, "val"), "left"))
-            sp = first(ppr, "spacing")
-            if sp is not None:
-                if attr(sp, "before") is not None:
-                    css.append(f"margin-top:{tw_pt(attr(sp,'before')):.1f}pt")
-                if attr(sp, "after") is not None:
-                    css.append(f"margin-bottom:{tw_pt(attr(sp,'after')):.1f}pt")
-                line = attr(sp, "line")
-                if line is not None and attr(sp, "lineRule") in (None, "auto"):
-                    css.append(f"line-height:{float(line)/240.0:.2f}")
-            ind = first(ppr, "ind")
-            if ind is not None:
-                has_ind = True
-                if attr(ind, "left"):
-                    css.append(f"margin-left:{tw_pt(attr(ind,'left')):.1f}pt")
-                if attr(ind, "right"):
-                    css.append(f"margin-right:{tw_pt(attr(ind,'right')):.1f}pt")
-                if attr(ind, "hanging"):
-                    css.append(f"text-indent:-{tw_pt(attr(ind,'hanging')):.1f}pt")
-                elif attr(ind, "firstLine"):
-                    css.append(f"text-indent:{tw_pt(attr(ind,'firstLine')):.1f}pt")
             pbdr = first(ppr, "pBdr")
             if pbdr is not None:
                 for side in ("top", "bottom", "left", "right"):
@@ -574,7 +699,9 @@ class Converter:
 
         # tamaño/fuente por defecto del párrafo (para que también afecte a
         # bullets y a la altura de líneas vacías)
-        css.append(f"font-family:{font_stack(base.get('font'))}")
+        fam = font_stack(base.get("font"))
+        if fam:
+            css.append(f"font-family:{fam}")
         css.append(f"font-size:{base.get('size',10.0):.1f}pt")
         if base.get("color"):
             css.append("color:" + base["color"])
@@ -585,6 +712,21 @@ class Converter:
         # salto de página explícito (<w:br w:type="page"/>) dentro del párrafo
         if p.find(".//" + w("br") + "[@" + w("type") + "='page']") is not None:
             css.append("break-after:page")
+
+        # salto de sección que inicia página nueva (sectPr en el pPr, salvo el
+        # "continuo"): en Word marca un límite de página, lo forzamos también.
+        if ppr is not None and not in_cell:
+            sectpr = first(ppr, "sectPr")
+            if sectpr is not None:
+                st = first(sectpr, "type")
+                if st is None or attr(st, "val") != "continuous":
+                    css.append("break-after:page")
+
+        # pista de paginación de Word (<w:lastRenderedPageBreak/>): partimos la
+        # página donde Word la partió, para acercar la maquetación a la suya.
+        if (RESPECT_PAGE_HINTS and not in_cell and self._content_started
+                and p.find(".//" + w("lastRenderedPageBreak")) is not None):
+            css.append("break-before:page")
 
         inner = self.render_runs(p, base)
 
@@ -715,7 +857,16 @@ class Converter:
             css.append("padding:4pt 6pt")
         if rowspan > 1:
             spanattr += f' rowspan="{rowspan}"'
-        inner = "".join(self.render_paragraph(p, in_cell=True) for p in tc.findall(w("p")))
+        # Renderiza párrafos y tablas anidadas en su orden de aparición (una
+        # tabla dentro de una celda no debe perderse).
+        inner_parts = []
+        for child in tc:
+            tag = etree.QName(child).localname
+            if tag == "p":
+                inner_parts.append(self.render_paragraph(child, in_cell=True))
+            elif tag == "tbl":
+                inner_parts.append(self.render_table(child))
+        inner = "".join(inner_parts)
         return f'<td{spanattr} style="{";".join(css)}">{inner}</td>'
 
     # -- cabecera / pie ----------------------------------------------------
@@ -779,6 +930,8 @@ class Converter:
                 blocks.append(self.render_table(child))
             else:
                 continue
+            self._content_started = True  # ya hay contenido: a partir de aquí
+                                          # sí valen las pistas de salto de página
             if self._pending_floats:  # imágenes flotantes "bloque" tras el bloque
                 blocks.extend(self._pending_floats)
                 self._pending_floats = []
@@ -823,15 +976,18 @@ class Converter:
                 f"{self._slot(ftr_even, 'bottom-center')} }}"
             )
 
+        root_family = font_stack(self.default.get("font")) or "Carlito, Calibri, sans-serif"
+        root_size = self.default.get("size", 10.0)
+        root_color = self.default.get("color", "#000000")
         page_css = f"""
         {base_page}
         {first_page}
         {even_page}
-        html {{ font-family: Carlito, Calibri, sans-serif; font-size: 10pt;
-                color: #000000; }}
+        html {{ font-family: {root_family}; font-size: {root_size:.1f}pt;
+                color: {root_color}; }}
         body {{ margin: 0; }}
         p {{ margin: 0; line-height: {BODY_LINE_HEIGHT}; }}
-        table {{ margin: 6pt 0; font-size: 10pt; }}
+        table {{ margin: 6pt 0; font-size: {root_size:.1f}pt; }}
         td p {{ margin: 0; line-height: {CELL_LINE_HEIGHT}; }}
         .pageno::after {{ content: counter(page); }}
         """

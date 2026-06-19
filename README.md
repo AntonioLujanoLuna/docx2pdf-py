@@ -50,18 +50,38 @@ Portada, cabecera/pie (incluidas las variantes **primera página** y
 encabezados, párrafos con fuente/color/negrita/cursiva/alineación,
 **hipervínculos** (con su URL real), **listas numeradas** (`1.`, `a)`, `IV.`…
 leídas de `numbering.xml`) y con viñeta, tablas (bordes, sombreados, celdas
-combinadas horizontal **y verticalmente**), saltos de página explícitos e
-**imágenes** (inline y flotantes; las flotantes con ajuste cuadrado/estrecho
-**rodean el texto** mediante `float`). El tamaño de página (incl. apaisado) se
-toma del `sectPr`. Los campos de Word (p. ej. `PAGE`) se interpretan, no se
-vuelca su valor cacheado.
+combinadas horizontal **y verticalmente**, y **tablas anidadas**), saltos de
+página explícitos e **imágenes** (inline y flotantes; las flotantes con ajuste
+cuadrado/estrecho **rodean el texto** mediante `float`). El tamaño de página
+(incl. apaisado) se toma del `sectPr`. Los campos de Word (p. ej. `PAGE`) se
+interpretan, no se vuelca su valor cacheado.
+
+Resuelve además las **fuentes de tema** (`asciiTheme`, p. ej. `minorHAnsi` →
+Calibri) leyéndolas de `theme1.xml`, y la **herencia de estilos**: cada estilo
+hereda el formato (carácter y párrafo) de su `basedOn`, y se aplican los valores
+por defecto del documento (`docDefaults`). Así, el tamaño/espaciado/negrita de un
+`Heading 1` definidos solo en `styles.xml` también se respetan.
+
+### Paginación
+
+Un `.docx` **no guarda páginas fijas**: Word las calcula al maquetar, así que
+una conversión por flujo no puede garantizar la correspondencia *página a página*
+sin el motor de maquetación de Word. Para acercarse lo más posible:
+
+- Los **saltos de sección** que inician página (`sectPr` con tipo ≠ `continuous`)
+  fuerzan un salto de página.
+- Se respetan las **pistas de paginación de Word** (`<w:lastRenderedPageBreak/>`),
+  que Word escribe donde partió la página la última vez que la renderizó. Es una
+  aproximación (puede quedar obsoleta si el documento se editó sin reabrirlo en
+  Word); se puede desactivar con la variable de entorno `RESPECT_PAGE_HINTS=0`.
 
 ## Limitaciones (conversor ligero, no un motor Word completo)
 
 - **Listas numeradas**: se renderiza el formato del nivel, pero no se aplican
   reinicios/overrides explícitos (`lvlOverride`, `startOverride`).
-- **Fuentes**: mapea Calibri→Carlito y Georgia→Gelasio; el resto usa la fuente real
-  si está instalada y, si no, cae en su familia genérica (serif/sans/monospace).
+- **Fuentes**: mapea Calibri→Carlito y Georgia→Gelasio (incl. las referidas por
+  tema vía `asciiTheme`); el resto usa la fuente real si está instalada y, si no,
+  cae en su familia genérica (serif/sans/monospace).
 - **Tamaño por defecto** 10 pt e **interlineado** ajustados a estilo "ofimático"
   común (configurables vía variables de entorno `BODY_LH` / `CELL_LH`).
 - **Imágenes flotantes**: el ajuste se aproxima con `float` (posición exacta por
