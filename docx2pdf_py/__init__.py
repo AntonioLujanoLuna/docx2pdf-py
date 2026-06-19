@@ -8,6 +8,10 @@ Uso:
     convert("entrada.docx", "salida.pdf")
 """
 from .converter import convert, Converter
+from .engines import default_engine, find_libreoffice, word_available
 
 __version__ = "0.1.0"
-__all__ = ["convert", "Converter", "__version__"]
+__all__ = [
+    "convert", "Converter", "__version__",
+    "default_engine", "find_libreoffice", "word_available",
+]

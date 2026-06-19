@@ -14,6 +14,7 @@ import base64
 import html as _html
 import os
 import re
+import sys
 import zipfile
 from typing import Optional
 
@@ -999,8 +1000,17 @@ class Converter:
         )
 
 
-def convert(in_path: str, out_path: str) -> str:
-    """Convierte ``in_path`` (.docx) a ``out_path`` (.pdf). Devuelve out_path."""
+# Alias aceptados para cada motor de conversión.
+_ENGINE_ALIASES = {
+    "auto": "auto",
+    "word": "word", "msword": "word",
+    "libreoffice": "libreoffice", "soffice": "libreoffice", "lo": "libreoffice",
+    "weasyprint": "weasyprint", "flow": "weasyprint", "python": "weasyprint",
+}
+
+
+def _convert_weasyprint(in_path: str, out_path: str) -> str:
+    """Flujo propio: OOXML -> HTML -> PDF con WeasyPrint (paginación aproximada)."""
     # Import diferido: así se puede importar el paquete (y probar build_html)
     # sin tener WeasyPrint —y sus librerías de sistema— instalado.
     from weasyprint import HTML
@@ -1009,3 +1019,59 @@ def convert(in_path: str, out_path: str) -> str:
         html = conv.build_html()
     HTML(string=html).write_pdf(out_path)
     return out_path
+
+
+def convert(in_path: str, out_path: str, engine: str = "auto") -> str:
+    """Convierte ``in_path`` (.docx) a ``out_path`` (.pdf). Devuelve out_path.
+
+    ``engine`` elige el motor de maquetación:
+
+    - ``"auto"`` (por defecto): usa Microsoft Word o LibreOffice si están
+      disponibles —paginación fiel, mismo contenido por página que el .docx— y,
+      si no, recurre al flujo lxml + WeasyPrint.
+    - ``"word"`` / ``"libreoffice"`` / ``"weasyprint"``: fuerza ese motor (falla
+      si el elegido no está disponible).
+    """
+    from . import engines
+
+    key = _ENGINE_ALIASES.get((engine or "auto").lower())
+    if key is None:
+        raise ValueError(
+            f"motor desconocido: {engine!r} (usa auto/word/libreoffice/weasyprint)"
+        )
+
+    if key == "auto":
+        # Probamos motores reales en orden; si uno falla en ejecución, pasamos
+        # al siguiente y, en último término, al flujo HTML.
+        attempts = (
+            ("word", engines.word_available, engines.convert_word),
+            ("libreoffice", lambda: bool(engines.find_libreoffice()),
+             engines.convert_libreoffice),
+        )
+        for label, ready, run in attempts:
+            if ready():
+                try:
+                    return run(in_path, out_path)
+                except Exception as exc:  # noqa: BLE001 — degradar con aviso
+                    sys.stderr.write(
+                        f"[docx2pdf-py] el motor '{label}' falló ({exc}); "
+                        "probando el siguiente\n"
+                    )
+        return _convert_weasyprint(in_path, out_path)
+
+    if key == "word":
+        if not engines.word_available():
+            raise RuntimeError(
+                "se pidió Word pero no está disponible "
+                "(solo Windows/macOS con Word instalado)"
+            )
+        return engines.convert_word(in_path, out_path)
+
+    if key == "libreoffice":
+        if not engines.find_libreoffice():
+            raise RuntimeError(
+                "se pidió LibreOffice pero no se encontró 'soffice' en el sistema"
+            )
+        return engines.convert_libreoffice(in_path, out_path)
+
+    return _convert_weasyprint(in_path, out_path)
