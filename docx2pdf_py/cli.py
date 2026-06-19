@@ -6,6 +6,7 @@ import sys
 
 from . import __version__
 from .converter import convert
+from .engines import default_engine
 
 
 def main(argv=None):
@@ -19,6 +20,11 @@ def main(argv=None):
                         help="ruta del PDF de salida (por defecto: output.pdf)")
     parser.add_argument("-f", "--force", action="store_true",
                         help="sobrescribe el PDF de salida si ya existe")
+    parser.add_argument("-e", "--engine", default="auto",
+                        choices=["auto", "word", "libreoffice", "weasyprint"],
+                        help="motor de maquetación (por defecto: auto). 'word' y "
+                             "'libreoffice' dan paginación fiel; 'weasyprint' usa "
+                             "el flujo propio (aproximado)")
     parser.add_argument("--version", action="version",
                         version=f"%(prog)s {__version__}")
     args = parser.parse_args(argv)
@@ -34,8 +40,9 @@ def main(argv=None):
     if os.path.exists(args.salida) and not args.force:
         parser.error(f"la salida ya existe: {args.salida} (usa -f para sobrescribir)")
 
-    convert(src, args.salida)
-    print(f"✅ {src}  ->  {args.salida}")
+    used = args.engine if args.engine != "auto" else f"auto ({default_engine()})"
+    convert(src, args.salida, engine=args.engine)
+    print(f"✅ {src}  ->  {args.salida}  [motor: {used}]")
     return 0
 
 

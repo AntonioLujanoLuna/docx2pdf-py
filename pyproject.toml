@@ -27,7 +27,9 @@ dependencies = [
 dev = ["pytest>=7"]
 
 [project.urls]
-Homepage = "https://github.com/javiertejero/docx2pdf-py"
+Homepage = "https://github.com/antoniolujanoluna/docx2pdf-py"
+Repository = "https://github.com/antoniolujanoluna/docx2pdf-py"
+Issues = "https://github.com/antoniolujanoluna/docx2pdf-py/issues"
 
 [project.scripts]
 docx2pdf-py = "docx2pdf_py.cli:main"
