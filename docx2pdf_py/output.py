@@ -17,8 +17,8 @@ _PAGE_OBJECT = re.compile(rb"/Type\s*/Page(?!s)\b")
 MAX_PDF_BYTES = 1024 * 1024 * 1024
 
 
-def validate_pdf(path: Pathish) -> int:
-    """Validate basic PDF structure and return its page-object count."""
+def validate_pdf(path: Pathish) -> int | None:
+    """Validate basic PDF structure and return a page count when detectable."""
     candidate = Path(path)
     try:
         with candidate.open("rb") as stream:
@@ -42,9 +42,7 @@ def validate_pdf(path: Pathish) -> int:
         with candidate.open("rb") as stream:
             while chunk := stream.read(1024 * 1024):
                 pages += len(_PAGE_OBJECT.findall(chunk))
-    if pages == 0:
-        raise ConversionError(f"conversion produced a PDF with no pages: {candidate}")
-    return pages
+    return pages or None
 
 
 def publish_pdf(source: Pathish, destination: Pathish) -> str:

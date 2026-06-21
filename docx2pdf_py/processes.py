@@ -7,6 +7,8 @@ import signal
 import subprocess
 from collections.abc import Sequence
 
+_CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
 
 def _terminate_tree(process: subprocess.Popen[bytes]) -> None:
     if os.name == "nt":
@@ -21,8 +23,13 @@ def _terminate_tree(process: subprocess.Popen[bytes]) -> None:
             process.kill()
             return
     else:
+        killpg = getattr(os, "killpg", None)
+        sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+        if killpg is None:
+            process.kill()
+            return
         try:
-            os.killpg(process.pid, signal.SIGKILL)  # type: ignore[attr-defined]
+            killpg(process.pid, sigkill)
         except ProcessLookupError:
             return
     try:
@@ -40,7 +47,7 @@ def run_process(
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            creationflags=_CREATE_NEW_PROCESS_GROUP,
         )
     else:
         process = subprocess.Popen(  # noqa: S603

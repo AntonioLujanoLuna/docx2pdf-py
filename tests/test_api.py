@@ -88,6 +88,26 @@ def test_pdf_validation_checks_structure_and_counts_pages(tmp_path):
         validate_pdf(incomplete)
 
 
+def test_pdf_validation_accepts_structural_pdf_without_detectable_page_objects(tmp_path):
+    compressed = tmp_path / "compressed.pdf"
+    compressed.write_bytes(
+        b"".join(
+            (
+                b"%PDF-1.5\n",
+                b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+                b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+                (
+            b"3 0 obj\n<< /Length 14 /Filter /FlateDecode >>\nstream\n"
+            b"x\x9c+\xe4\x02\x00\x00\xee\x00y\nendstream\nendobj\n"
+                ),
+                b"xref\n0 4\n0000000000 65535 f \n",
+                b"trailer\n<< /Root 1 0 R /Size 4 >>\nstartxref\n9\n%%EOF\n",
+            )
+        )
+    )
+    assert validate_pdf(compressed) is None
+
+
 def test_converter_closes_zip_when_initialization_fails(tmp_path, monkeypatch):
     source = tmp_path / "bad.docx"
     with zipfile.ZipFile(source, "w") as archive:

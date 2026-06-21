@@ -99,7 +99,11 @@ def word_available() -> bool:
         try:
             import winreg
 
-            with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, r"Word.Application\CLSID"):
+            open_key = getattr(winreg, "OpenKey", None)
+            classes_root = getattr(winreg, "HKEY_CLASSES_ROOT", None)
+            if open_key is None or classes_root is None:
+                return False
+            with open_key(classes_root, r"Word.Application\CLSID"):
                 installed = True
         except (ImportError, FileNotFoundError, OSError):
             installed = False

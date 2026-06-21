@@ -1,5 +1,7 @@
 """Engine protocol, fallback policy, diagnostics, and batch conversion tests."""
 
+from __future__ import annotations
+
 import shutil
 from dataclasses import dataclass
 from threading import Event
