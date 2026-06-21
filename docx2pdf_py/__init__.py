@@ -7,11 +7,34 @@ Uso:
     from docx2pdf_py import convert
     convert("entrada.docx", "salida.pdf")
 """
-from .converter import Converter, convert
-from .engines import default_engine, find_libreoffice, word_available
+from importlib.metadata import PackageNotFoundError, version
 
-__version__ = "0.1.0"
+from .api import convert, convert_batch, convert_detailed
+from .converter import Converter
+from .engine_protocol import ConversionEngine
+from .engines import default_engine, find_libreoffice, word_available
+from .exceptions import (
+    ConversionError,
+    ConversionTimeoutError,
+    Docx2PdfError,
+    EngineUnavailableError,
+    InvalidDocumentError,
+)
+from .models import (
+    BatchItemResult,
+    ConversionAttempt,
+    ConversionOptions,
+    ConversionResult,
+)
+
+try:
+    __version__ = version("docx2pdf-py")
+except PackageNotFoundError:
+    __version__ = "0+unknown"
 __all__ = [
-    "convert", "Converter", "__version__",
+    "convert", "convert_detailed", "convert_batch", "Converter", "ConversionOptions",
+    "ConversionResult", "ConversionAttempt", "BatchItemResult", "ConversionEngine",
+    "Docx2PdfError", "InvalidDocumentError", "EngineUnavailableError",
+    "ConversionError", "ConversionTimeoutError", "__version__",
     "default_engine", "find_libreoffice", "word_available",
 ]

@@ -5,10 +5,13 @@ OOXML que LibreOffice acepta), lo convierte a PDF y verifica el resultado.
 Pensado para CI con LibreOffice instalado. Si no hay 'soffice' disponible, se
 salta (no falla), para poder ejecutarlo también en local sin LibreOffice.
 """
+import os
 import sys
 import tempfile
 import zipfile
 from pathlib import Path
+
+from pypdf import PdfReader
 
 from docx2pdf_py import convert, default_engine
 from docx2pdf_py.engines import find_libreoffice
@@ -37,6 +40,7 @@ ROOT_RELS = DECL + (
 )
 
 DOCUMENT_RELS = DECL + f'<Relationships xmlns="{PKG}/relationships"></Relationships>'
+STYLES = DECL + f'<w:styles xmlns:w="{W}"></w:styles>'
 
 DOCUMENT = DECL + (
     f'<w:document xmlns:w="{W}"><w:body>'
@@ -52,10 +56,12 @@ def make_full_docx(path: Path) -> None:
         z.writestr("_rels/.rels", ROOT_RELS)
         z.writestr("word/_rels/document.xml.rels", DOCUMENT_RELS)
         z.writestr("word/document.xml", DOCUMENT)
+        z.writestr("word/styles.xml", STYLES)
 
 
 def main() -> int:
-    if not find_libreoffice():
+    engine = os.environ.get("E2E_ENGINE", "libreoffice")
+    if engine == "libreoffice" and not find_libreoffice():
         print("LibreOffice no disponible; se omite el smoke test e2e.")
         return 0
     with tempfile.TemporaryDirectory() as tmp:
@@ -63,10 +69,13 @@ def main() -> int:
         out = Path(tmp) / "sample.pdf"
         make_full_docx(src)
         print(f"Motor por defecto: {default_engine()}")
-        convert(str(src), str(out), engine="libreoffice")
+        convert(str(src), str(out), engine=engine)
         data = out.read_bytes()
         assert data.startswith(b"%PDF"), "la salida no es un PDF válido"
         assert len(data) > 500, "el PDF parece vacío"
+        pdf = PdfReader(out)
+        assert len(pdf.pages) == 1, "el documento de referencia debe tener una página"
+        assert "Hola, mundo desde docx2pdf-py." in pdf.pages[0].extract_text()
         print(f"OK: PDF generado ({len(data)} bytes).")
     return 0
 

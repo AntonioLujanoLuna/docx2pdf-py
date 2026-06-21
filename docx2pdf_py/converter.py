@@ -11,309 +11,93 @@ Usage:
     convert("input.docx", "output.pdf")
 """
 import base64
-import concurrent.futures
-import html as _html
-import os
+import hashlib
 import re
+import subprocess
 import sys
-import zipfile
+import tempfile
+from pathlib import Path
 from typing import Any, Optional
 
 from lxml import etree
 
-W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-A = "http://schemas.openxmlformats.org/drawingml/2006/main"
-R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-WP = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
-DC = "http://purl.org/dc/elements/1.1/"
-CP = "http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
-
-# Hardened parser: a .docx is untrusted input. Disable entity resolution
-# (XXE / "billion laughs") and network access.
-_PARSER = etree.XMLParser(resolve_entities=False, no_network=True, huge_tree=False)
+from .exceptions import (
+    ConversionError,
+    ConversionTimeoutError,
+)
+from .formatting import (
+    BULLET_GLYPHS,
+    _format_num,
+    border_css,
+    font_stack,
+    rpr_dict,
+    run_css,
+)
+from .formatting import _to_letter as _to_letter
+from .formatting import _to_roman as _to_roman
+from .models import ConversionOptions, ConversionResult, Engine
+from .ooxml import (
+    CP,
+    DC,
+    WP,
+    A,
+    C,
+    OOXMLPackage,
+    R,
+    attr,
+    emu_pt,
+    esc,
+    first,
+    keep_spaces,
+    on,
+    tw_cm,
+    tw_pt,
+    w,
+)
+from .output import Pathish, publish_pdf
+from .processes import run_process
 
 # Defensive limits against zip bombs: max decompressed size per member and
 # in total (a normal .docx is well below these figures).
 MAX_MEMBER_BYTES = 200 * 1024 * 1024
 MAX_TOTAL_BYTES = 500 * 1024 * 1024
-
-# Unit-conversion constants.
-_EMU_PER_PT: float = 12700.0   # English Metric Units per typographic point
-_TWIP_PER_PT: float = 20.0     # twentieths of a point per point
-_TWIP_PER_CM: float = 566.929  # twentieths of a point per centimetre
+MAX_XML_ELEMENTS = 2_000_000
 
 # WeasyPrint rendering timeout in seconds (0 = no timeout).
-_WEASYPRINT_TIMEOUT = int(os.environ.get("WEASYPRINT_TIMEOUT", "120"))
-
 BLOCK_IMG_STYLE = "display:block;margin:6pt auto;max-width:100%;"
 
 
-def _xml(data: bytes):
-    return etree.fromstring(data, _PARSER)
-
-
-def w(tag: str) -> str:
-    return f"{{{W}}}{tag}"
-
-
-def emu_pt(emu) -> float:
-    return float(emu) / _EMU_PER_PT
-
-
-def first(el, tag: str):
-    if el is None:
-        return None
-    return el.find(w(tag))
-
-
-def attr(el, name: str):
-    if el is None:
-        return None
-    return el.get(w(name))
-
-
-def on(el):
-    """Un elemento booleano OOXML (w:b, w:i, ...) está activo salvo val=0/false."""
-    if el is None:
-        return None
-    v = el.get(w("val"))
-    return v not in ("0", "false", "off")
-
-
-def tw_pt(twips) -> float:
-    return float(twips) / _TWIP_PER_PT
-
-
-def tw_cm(twips) -> float:
-    return float(twips) / _TWIP_PER_CM
-
-
-def esc(s: str) -> str:
-    return _html.escape(s, quote=False)
-
-
-def keep_spaces(s: str) -> str:
-    """Conserva espacios múltiples/iniciales (HTML los colapsaría)."""
-    s = esc(s)
-    s = re.sub(r"  +", lambda m: " " + " " * (len(m.group(0)) - 1), s)
-    if s.startswith(" "):
-        s = " " + s[1:]
-    return s
-
-
-# -- numeración de listas ----------------------------------------------------
-def _to_letter(n: int) -> str:
-    """1 -> a, 26 -> z, 27 -> aa (estilo Word lowerLetter/upperLetter)."""
-    s = ""
-    while n > 0:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
-    return s or "A"
-
-
-def _to_roman(n: int) -> str:
-    if n <= 0:
-        return str(n)
-    table = [(1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"),
-             (90, "XC"), (50, "L"), (40, "XL"), (10, "X"), (9, "IX"),
-             (5, "V"), (4, "IV"), (1, "I")]
-    out = ""
-    for v, sym in table:
-        while n >= v:
-            out += sym
-            n -= v
-    return out
-
-
-def _format_num(n: int, fmt: str) -> str:
-    if fmt == "lowerLetter":
-        return _to_letter(n).lower()
-    if fmt == "upperLetter":
-        return _to_letter(n).upper()
-    if fmt == "lowerRoman":
-        return _to_roman(n).lower()
-    if fmt == "upperRoman":
-        return _to_roman(n).upper()
-    if fmt == "decimalZero":
-        return f"{n:02d}"
-    return str(n)
-
-
-# Fuentes con sustituto métricamente compatible y libre.
-FONT_MAP = {
-    "Calibri": "Carlito, Calibri, sans-serif",
-    "Georgia": "Gelasio, Georgia, serif",
-}
-
-# Familia genérica de respaldo para fuentes habituales (si no están instaladas,
-# al menos caen en el género correcto en vez de siempre en sans-serif).
-GENERIC_FAMILY = {
-    "Times New Roman": "serif",
-    "Cambria": "serif",
-    "Garamond": "serif",
-    "Book Antiqua": "serif",
-    "Palatino Linotype": "serif",
-    "Courier New": "monospace",
-    "Consolas": "monospace",
-    "Lucida Console": "monospace",
-}
-
-# Colores con nombre del resaltado de Word (<w:highlight w:val="yellow"/>).
-HIGHLIGHT_COLORS = {
-    "black": "#000000", "blue": "#0000FF", "cyan": "#00FFFF",
-    "darkBlue": "#000080", "darkCyan": "#008080", "darkGray": "#808080",
-    "darkGreen": "#008000", "darkMagenta": "#800080", "darkRed": "#800000",
-    "darkYellow": "#808000", "green": "#00FF00", "lightGray": "#C0C0C0",
-    "magenta": "#FF00FF", "red": "#FF0000", "white": "#FFFFFF",
-    "yellow": "#FFFF00",
-}
-
-# Glifos de viñeta más habituales por carácter o por fuente de símbolos
-# (Wingdings/Symbol usan code points privados); se cae a "•" si no se reconoce.
-BULLET_GLYPHS = {
-    "": "•", "": "▪", "": "✓", "": "➢",
-    "o": "o", "•": "•", "▪": "▪", "·": "·",
-    "–": "–", "−": "–", "*": "•",
-}
-
-# Interlineado por defecto (ajustable para casar con el motor de referencia).
-BODY_LINE_HEIGHT = float(os.environ.get("BODY_LH", "1.0"))
-CELL_LINE_HEIGHT = float(os.environ.get("CELL_LH", "1.16"))
-
-# Un .docx no guarda páginas fijas: Word las calcula al maquetar. Para acercar
-# la paginación del PDF a la de Word respetamos sus "pistas" de salto de página
-# (<w:lastRenderedPageBreak/>), que Word escribe donde partió la página la última
-# vez que la renderizó. Es una aproximación (puede quedar obsoleta si el .docx se
-# editó sin reabrir en Word); se puede desactivar con RESPECT_PAGE_HINTS=0.
-RESPECT_PAGE_HINTS = os.environ.get("RESPECT_PAGE_HINTS", "1") not in ("0", "false", "off")
-
-
-def font_stack(name: Optional[str]) -> Optional[str]:
-    if not name:
-        return None
-    if name in FONT_MAP:
-        return FONT_MAP[name]
-    generic = GENERIC_FAMILY.get(name, "sans-serif")
-    return f"'{name}', {generic}"
-
-
-# ----------------------------------------------------------------------------
-# Resolución de formato de "run" (carácter)
-# ----------------------------------------------------------------------------
-def rpr_dict(rpr) -> dict:
-    """Extrae propiedades de carácter de un <w:rPr>."""
-    d: dict[str, Any] = {}
-    if rpr is None:
-        return d
-    fonts = first(rpr, "rFonts")
-    if fonts is not None:
-        if attr(fonts, "ascii"):
-            d["font"] = attr(fonts, "ascii")
-        elif attr(fonts, "asciiTheme"):
-            # fuente de tema (p.ej. minorHAnsi -> Calibri); se resuelve luego
-            # contra theme1.xml. font=None pisa cualquier fuente heredada al
-            # fusionar (la rFonts del run manda sobre la del estilo por defecto).
-            d["font_theme"] = attr(fonts, "asciiTheme")
-            d["font"] = None
-    b = on(first(rpr, "b"))
-    if b is not None:
-        d["bold"] = b
-    i = on(first(rpr, "i"))
-    if i is not None:
-        d["italic"] = i
-    strike = on(first(rpr, "strike"))
-    if strike is not None:
-        d["strike"] = strike
-    u = first(rpr, "u")
-    if u is not None:
-        d["underline"] = attr(u, "val") not in (None, "none")
-    color = first(rpr, "color")
-    if color is not None:
-        v = attr(color, "val")
-        if v and v != "auto":
-            d["color"] = "#" + v
-    sz = first(rpr, "sz")
-    if sz is not None:
-        d["size"] = float(attr(sz, "val")) / 2.0
-    va = first(rpr, "vertAlign")
-    if va is not None:
-        d["va"] = attr(va, "val")
-    hl = first(rpr, "highlight")
-    if hl is not None:
-        v = attr(hl, "val")
-        if v and v != "none":
-            d["highlight"] = HIGHLIGHT_COLORS.get(v, v)
-    caps = on(first(rpr, "caps"))
-    if caps is not None:
-        d["caps"] = caps
-    smallcaps = on(first(rpr, "smallCaps"))
-    if smallcaps is not None:
-        d["smallcaps"] = smallcaps
-    return d
-
-
-def run_css(d: dict) -> str:
-    css = []
-    if d.get("font"):
-        css.append(f"font-family:{font_stack(d['font'])}")
-    if "bold" in d:
-        css.append("font-weight:" + ("bold" if d["bold"] else "normal"))
-    if "italic" in d:
-        css.append("font-style:" + ("italic" if d["italic"] else "normal"))
-    deco = []
-    if d.get("underline"):
-        deco.append("underline")
-    if d.get("strike"):
-        deco.append("line-through")
-    if deco:
-        css.append("text-decoration:" + " ".join(deco))
-    if d.get("color"):
-        css.append("color:" + d["color"])
-    if d.get("highlight"):
-        css.append("background-color:" + d["highlight"])
-    # caps -> mayúsculas; smallCaps -> versalitas. Word da prioridad a caps.
-    if d.get("caps"):
-        css.append("text-transform:uppercase")
-    elif d.get("smallcaps"):
-        css.append("font-variant:small-caps")
-    size = d.get("size")
-    va = d.get("va")
-    if va in ("superscript", "subscript"):
-        css.append("vertical-align:" + ("super" if va == "superscript" else "sub"))
-        if size:
-            size = size * 0.7
-    if size:
-        css.append(f"font-size:{size:.1f}pt")
-    return ";".join(css)
-
-
-def border_css(b) -> Optional[str]:
-    """CSS de un borde OOXML (<w:top>/<w:bottom>/...)."""
-    if b is None:
-        return None
-    val = attr(b, "val")
-    if val in (None, "nil", "none"):
-        return "none"
-    sz = attr(b, "sz")
-    width = max(float(sz) / 8.0, 0.5) if sz else 0.5
-    color = attr(b, "color") or "000000"
-    if color == "auto":
-        color = "000000"
-    return f"{width:.2f}pt solid #{color}"
-
-
-class Converter:
-    def __init__(self, path: str):
-        self.z: Optional[zipfile.ZipFile] = zipfile.ZipFile(path)
-        self._read_bytes = 0
-        self.doc = self._require_xml_part("word/document.xml")
-        self.styles = self._require_xml_part("word/styles.xml")
-        self.rels = self._index_rels()
-        self.theme_fonts = self._index_theme()
-        self.def_rpr, self.def_ppr = self._doc_defaults()
-        self.style_ppr: dict[str, Any] = {}  # styleId -> resolved paragraph props
-        self.style_rpr = self._index_styles()
-        self.num_levels = self._index_numbering()
+class Converter(OOXMLPackage):
+    def __init__(
+        self,
+        path: Pathish,
+        options: Optional[ConversionOptions] = None,
+        asset_directory: Optional[Pathish] = None,
+    ):
+        self.options = options or ConversionOptions.from_environment()
+        self.asset_directory = Path(asset_directory) if asset_directory else None
+        if self.asset_directory:
+            self.asset_directory.mkdir(parents=True, exist_ok=True)
+        super().__init__(
+            path,
+            max_member_bytes=MAX_MEMBER_BYTES,
+            max_total_bytes=MAX_TOTAL_BYTES,
+            max_xml_elements=MAX_XML_ELEMENTS,
+        )
+        try:
+            self.doc = self._require_xml_part("word/document.xml")
+            self.styles = self._require_xml_part("word/styles.xml")
+            self.rels = self._index_rels()
+            self.theme_fonts = self._index_theme()
+            self.def_rpr, self.def_ppr = self._doc_defaults()
+            self.style_ppr: dict[str, Any] = {}  # styleId -> resolved paragraph props
+            self.style_rpr = self._index_styles()
+            self.num_levels = self._index_numbering()
+            self.footnotes = self._opt("word/footnotes.xml")
+            self.endnotes = self._opt("word/endnotes.xml")
+        except Exception:
+            self.close()
+            raise
         # Default font/size; overridden by <w:docDefaults> when present.
         self.default: dict[str, Any] = {"font": "Calibri", "color": "#000000", "size": 10.0}
         for k in ("font", "size", "color", "bold", "italic"):
@@ -352,40 +136,6 @@ class Converter:
         self.close()
         return False
 
-    def close(self) -> None:
-        """Close the .docx (releases the ZIP file descriptor)."""
-        if self.z is not None:
-            self.z.close()
-            self.z = None
-
-    # -- lectura segura del ZIP -------------------------------------------
-    def _read(self, name: str) -> bytes:
-        if self.z is None:
-            raise RuntimeError("Converter is already closed")
-        info = self.z.getinfo(name)
-        if info.file_size > MAX_MEMBER_BYTES:
-            raise ValueError(f"oversized member in .docx: {name}")
-        self._read_bytes += info.file_size
-        if self._read_bytes > MAX_TOTAL_BYTES:
-            raise ValueError("uncompressed .docx exceeds the maximum allowed size")
-        return self.z.read(name)
-
-    def _xml_part(self, name: str):
-        return _xml(self._read(name))
-
-    def _require_xml_part(self, name: str):
-        """Like _xml_part but raises ValueError (not KeyError) when absent."""
-        try:
-            return self._xml_part(name)
-        except KeyError as exc:
-            raise ValueError(f"required OOXML part missing from .docx: {name}") from exc
-
-    def _opt(self, name: str):
-        try:
-            return self._xml_part(name)
-        except KeyError:
-            return None
-
     def _index_rels(self) -> dict:
         try:
             root = self._xml_part("word/_rels/document.xml.rels")
@@ -402,7 +152,7 @@ class Converter:
                 rid = ref.get(f"{{{R}}}id")
                 target = self.rels.get(rid)
                 if target:
-                    return self._opt("word/" + target)
+                    return self._opt(self._resolve_part("word", target))
         return None
 
     # -- tema / valores por defecto / herencia de estilos -----------------
@@ -532,8 +282,8 @@ class Converter:
             seen = seen | {sid}
             parent = (resolve(node["based"], seen) if node["based"]
                       else {"rpr": {}, "ppr": {}})
-            merged_rpr = dict(parent["rpr"]); merged_rpr.update(node["rpr"])
-            merged_ppr = dict(parent["ppr"]); merged_ppr.update(node["ppr"])
+            merged_rpr = {**dict(parent["rpr"]), **dict(node["rpr"] or {})}
+            merged_ppr = {**dict(parent["ppr"]), **dict(node["ppr"] or {})}
             resolved[sid] = {"rpr": merged_rpr, "ppr": merged_ppr}
             return resolved[sid]
 
@@ -551,25 +301,28 @@ class Converter:
             numx = self._xml_part("word/numbering.xml")
         except KeyError:
             return {}
+        def parse_level(lvl):
+            fmt = first(lvl, "numFmt")
+            txt = first(lvl, "lvlText")
+            start = first(lvl, "start")
+            ppr = first(lvl, "pPr")
+            ind = first(ppr, "ind") if ppr is not None else None
+            return {
+                "fmt": attr(fmt, "val") if fmt is not None else "decimal",
+                "text": attr(txt, "val") if txt is not None else "",
+                "start": (int(attr(start, "val"))
+                          if start is not None and attr(start, "val") else 1),
+                "left": attr(ind, "left") if ind is not None else None,
+                "hanging": attr(ind, "hanging") if ind is not None else None,
+            }
+
         abstract = {}
         for an in numx.findall(w("abstractNum")):
             aid = an.get(w("abstractNumId"))
             levels = {}
             for lvl in an.findall(w("lvl")):
                 ilvl = int(lvl.get(w("ilvl")) or 0)
-                fmt = first(lvl, "numFmt")
-                txt = first(lvl, "lvlText")
-                start = first(lvl, "start")
-                ppr = first(lvl, "pPr")
-                ind = first(ppr, "ind") if ppr is not None else None
-                levels[ilvl] = {
-                    "fmt": attr(fmt, "val") if fmt is not None else "decimal",
-                    "text": attr(txt, "val") if txt is not None else "",
-                    "start": (int(attr(start, "val"))
-                              if start is not None and attr(start, "val") else 1),
-                    "left": attr(ind, "left") if ind is not None else None,
-                    "hanging": attr(ind, "hanging") if ind is not None else None,
-                }
+                levels[ilvl] = parse_level(lvl)
             abstract[aid] = levels
         out: dict[str, Any] = {}
         for num in numx.findall(w("num")):
@@ -577,7 +330,18 @@ class Converter:
             a = first(num, "abstractNumId")
             aid = attr(a, "val") if a is not None else None
             if aid in abstract:
-                out[nid] = abstract[aid]
+                levels = {level: dict(value) for level, value in abstract[aid].items()}
+                for override in num.findall(w("lvlOverride")):
+                    ilvl = int(override.get(w("ilvl")) or 0)
+                    replacement = first(override, "lvl")
+                    if replacement is not None:
+                        levels[ilvl] = parse_level(replacement)
+                    start_override = first(override, "startOverride")
+                    if start_override is not None and attr(start_override, "val"):
+                        levels.setdefault(ilvl, {"fmt": "decimal", "text": "", "start": 1,
+                                                 "left": None, "hanging": None})
+                        levels[ilvl]["start"] = int(attr(start_override, "val"))
+                out[nid] = levels
         return out
 
     def _bullet_glyph(self, num_id, ilvl: int) -> str:
@@ -619,7 +383,11 @@ class Converter:
         in_field = False
         for child in p:
             tag = etree.QName(child).localname
-            if tag == "hyperlink":
+            if tag in ("ins", "moveTo", "smartTag", "sdt"):
+                parts.append(self.render_runs(child, base))
+            elif tag in ("del", "moveFrom"):
+                continue
+            elif tag == "hyperlink":
                 inner = self.render_runs(child, base)
                 rid = child.get(f"{{{R}}}id")
                 href = self.rels.get(rid) if rid else None
@@ -641,6 +409,10 @@ class Converter:
                     in_field = False
                 if not skip:
                     parts.append(self._render_run(child, base))
+            elif tag in ("oMath", "oMathPara"):
+                equation = "".join(child.itertext()).strip()
+                if equation:
+                    parts.append(f'<span class="equation">{esc(equation)}</span>')
         return "".join(parts)
 
     def _render_run(self, r, base: dict) -> str:
@@ -658,8 +430,37 @@ class Converter:
                     img = self._render_drawing(child)
                     if img:
                         images.append(img)
+                textbox = child.find(".//" + w("txbxContent"))
+                if textbox is not None:
+                    chunks.append(
+                        '<span class="textbox">'
+                        + "<br>".join(
+                            self.render_runs(p, base) for p in textbox.findall(w("p"))
+                        )
+                        + "</span>"
+                    )
+                if child.find(".//" + f"{{{C}}}chart") is not None and not images:
+                    chunks.append('<span class="unsupported chart">[Chart]</span>')
+            elif tag == "pict":
+                textbox = child.find(".//" + w("txbxContent"))
+                if textbox is not None:
+                    chunks.append(
+                        '<span class="textbox">'
+                        + "<br>".join(
+                            self.render_runs(p, base) for p in textbox.findall(w("p"))
+                        )
+                        + "</span>"
+                    )
+            elif tag == "object":
+                chunks.append('<span class="unsupported object">[Embedded object]</span>')
             elif tag == "t":
                 chunks.append(keep_spaces(child.text or ""))
+            elif tag in ("footnoteReference", "endnoteReference"):
+                note_id = child.get(w("id")) or ""
+                kind = "footnote" if tag == "footnoteReference" else "endnote"
+                chunks.append(
+                    f'<sup><a href="#{kind}-{esc(note_id)}">{esc(note_id)}</a></sup>'
+                )
             elif tag == "tab":
                 chunks.append("    ")
             elif tag == "cr":
@@ -674,13 +475,20 @@ class Converter:
             out = f'<span style="{css}">{text}</span>' if css else text
         return out + "".join(images)
 
-    def _data_uri(self, target: str) -> str:
+    def _image_src(self, target: str) -> str:
         if target not in self._img_cache:
             ext = target.rsplit(".", 1)[-1].lower()
-            mime = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "gif": "gif",
-                    "bmp": "bmp", "svg": "svg+xml"}.get(ext, ext)
-            data = base64.b64encode(self._read("word/" + target)).decode()
-            self._img_cache[target] = f"data:image/{mime};base64,{data}"
+            data = self._read(self._resolve_part("word", target))
+            if self.asset_directory:
+                safe_ext = ext if ext.isalnum() and len(ext) <= 8 else "bin"
+                name = hashlib.sha256(target.encode()).hexdigest()[:20] + "." + safe_ext
+                (self.asset_directory / name).write_bytes(data)
+                self._img_cache[target] = f"assets/{name}"
+            else:
+                mime = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "gif": "gif",
+                        "bmp": "bmp", "svg": "svg+xml"}.get(ext, ext)
+                encoded = base64.b64encode(data).decode()
+                self._img_cache[target] = f"data:image/{mime};base64,{encoded}"
         return self._img_cache[target]
 
     def _img_html(self, drawing, style: str) -> str:
@@ -695,7 +503,7 @@ class Converter:
         if ext is not None and ext.get("cx") and ext.get("cy"):
             dims = (f"width:{emu_pt(ext.get('cx')):.1f}pt;"
                     f"height:{emu_pt(ext.get('cy')):.1f}pt;")
-        return f'<img src="{self._data_uri(target)}" style="{style}{dims}">'
+        return f'<img src="{self._image_src(target)}" style="{style}{dims}">'
 
     def _render_drawing(self, drawing) -> str:
         return self._img_html(drawing, BLOCK_IMG_STYLE)
@@ -821,7 +629,7 @@ class Converter:
 
         # pista de paginación de Word (<w:lastRenderedPageBreak/>): partimos la
         # página donde Word la partió, para acercar la maquetación a la suya.
-        if (RESPECT_PAGE_HINTS and not in_cell and self._content_started
+        if (self.options.respect_page_hints and not in_cell and self._content_started
                 and p.find(".//" + w("lastRenderedPageBreak")) is not None):
             css.append("break-before:page")
 
@@ -908,7 +716,9 @@ class Converter:
                     cell["rowspan"] = rs
 
         rows = []
-        for cells in grid_rows:
+        source_rows = tbl.findall(w("tr"))
+        header_count = 0
+        for row_index, cells in enumerate(grid_rows):
             out_cells = []
             for cell in cells:
                 if cell["vmerge"] == "continue":
@@ -916,8 +726,16 @@ class Converter:
                 out_cells.append(
                     self._render_cell(cell["tc"], tblbdr, rowspan=cell["rowspan"])
                 )
-            rows.append("<tr>" + "".join(out_cells) + "</tr>")
-        return f'<table style="{";".join(style)}">{cols}{"".join(rows)}</table>'
+            trpr = first(source_rows[row_index], "trPr")
+            repeating = first(trpr, "tblHeader") is not None if trpr is not None else False
+            cant_split = first(trpr, "cantSplit") is not None if trpr is not None else False
+            if repeating and row_index == header_count:
+                header_count += 1
+            row_style = ' style="break-inside:avoid"' if cant_split else ""
+            rows.append(f"<tr{row_style}>" + "".join(out_cells) + "</tr>")
+        head = f'<thead>{"".join(rows[:header_count])}</thead>' if header_count else ""
+        body = f'<tbody>{"".join(rows[header_count:])}</tbody>'
+        return f'<table style="{";".join(style)}">{cols}{head}{body}</table>'
 
     def _render_cell(self, tc, tblbdr, rowspan: int = 1) -> str:
         tcpr = first(tc, "tcPr")
@@ -1006,6 +824,25 @@ class Converter:
         return f"@{where} {{ content: element({elem_name}); }}"
 
     # -- documento completo ------------------------------------------------
+    def _render_notes(self, root, kind: str) -> str:
+        if root is None:
+            return ""
+        entries = []
+        singular = "footnote" if kind == "footnotes" else "endnote"
+        for note in root.findall(w(singular)):
+            note_id = note.get(w("id"))
+            if note_id is None or int(note_id) < 0:
+                continue
+            inner = "".join(
+                self.render_paragraph(p, in_cell=True) for p in note.findall(w("p"))
+            )
+            entries.append(
+                f'<li id="{singular}-{esc(note_id)}" value="{esc(note_id)}">{inner}</li>'
+            )
+        if not entries:
+            return ""
+        return f'<section class="{kind}"><ol>{"".join(entries)}</ol></section>'
+
     def build_html(self) -> str:
         body = self.doc.find(w("body"))
         sect = body.find(w("sectPr"))
@@ -1019,21 +856,46 @@ class Converter:
         mr = float(attr(pgmar, "right")) if pgmar is not None else 1200
         content_cm = tw_cm(pw - ml - mr)
         page_size = f"{tw_cm(pw):.2f}cm {tw_cm(ph):.2f}cm"
-
         blocks = []
+        section_blocks: list[str] = []
+        section_specs: list[Any] = []
+
+        def finish_section(spec):
+            if not section_blocks:
+                return
+            index = len(section_specs)
+            spec = spec if spec is not None else sect
+            section_specs.append(spec)
+            cols = first(spec, "cols")
+            count = int(attr(cols, "num")) if cols is not None and attr(cols, "num") else 1
+            gap = tw_pt(attr(cols, "space")) if cols is not None and attr(cols, "space") else 36
+            blocks.append(
+                f'<section class="doc-section section-{index}" '
+                f'style="column-count: {count};column-gap: {gap:.1f}pt">'
+                + "".join(section_blocks)
+                + "</section>"
+            )
+            section_blocks.clear()
+
         for child in body:
             tag = etree.QName(child).localname
             if tag == "p":
-                blocks.append(self.render_paragraph(child))
+                section_blocks.append(self.render_paragraph(child))
             elif tag == "tbl":
-                blocks.append(self.render_table(child))
+                section_blocks.append(self.render_table(child))
             else:
                 continue
             self._content_started = True  # ya hay contenido: a partir de aquí
                                           # sí valen las pistas de salto de página
             if self._pending_floats:  # imágenes flotantes "bloque" tras el bloque
-                blocks.extend(self._pending_floats)
+                section_blocks.extend(self._pending_floats)
                 self._pending_floats = []
+            child_sect = first(first(child, "pPr"), "sectPr") if tag == "p" else None
+            if child_sect is not None:
+                finish_section(child_sect)
+        finish_section(sect)
+        notes = self._render_notes(self.footnotes, "footnotes")
+        endnotes = self._render_notes(self.endnotes, "endnotes")
 
         # Cabeceras/pies por tipo. Cada variante presente se emite como un
         # running element con nombre propio y se asocia a su regla @page.
@@ -1059,6 +921,23 @@ class Converter:
             f"{tw_cm(mb):.2f}cm {tw_cm(ml):.2f}cm;\n"
             f"  {self._slot(hdr, 'top-center')} {self._slot(ftr, 'bottom-center')} }}"
         )
+        named_pages = []
+        for index, section_spec in enumerate(section_specs):
+            section_size = first(section_spec, "pgSz")
+            section_margin = first(section_spec, "pgMar")
+            sw = float(attr(section_size, "w")) if section_size is not None else pw
+            sh = float(attr(section_size, "h")) if section_size is not None else ph
+            smt = float(attr(section_margin, "top")) if section_margin is not None else mt
+            smb = float(attr(section_margin, "bottom")) if section_margin is not None else mb
+            sml = float(attr(section_margin, "left")) if section_margin is not None else ml
+            smr = float(attr(section_margin, "right")) if section_margin is not None else mr
+            named_pages.append(
+                f"@page section-{index} {{ size: {tw_cm(sw):.2f}cm {tw_cm(sh):.2f}cm; "
+                f"margin: {tw_cm(smt):.2f}cm {tw_cm(smr):.2f}cm "
+                f"{tw_cm(smb):.2f}cm {tw_cm(sml):.2f}cm; "
+                f"{self._slot(hdr, 'top-center')} {self._slot(ftr, 'bottom-center')} }} "
+                f".section-{index} {{ page: section-{index}; }}"
+            )
 
         first_page = ""
         if self.title_pg:
@@ -1080,14 +959,22 @@ class Converter:
         root_color = self.default.get("color", "#000000")
         page_css = f"""
         {base_page}
+        {"".join(named_pages)}
         {first_page}
         {even_page}
         html {{ font-family: {root_family}; font-size: {root_size:.1f}pt;
                 color: {root_color}; }}
         body {{ margin: 0; }}
-        p {{ margin: 0; line-height: {BODY_LINE_HEIGHT}; }}
+        .doc-section {{ column-fill: auto; }}
+        p {{ margin: 0; line-height: {self.options.body_line_height}; }}
         table {{ margin: 6pt 0; font-size: {root_size:.1f}pt; }}
-        td p {{ margin: 0; line-height: {CELL_LINE_HEIGHT}; }}
+        thead {{ display: table-header-group; }}
+        tr {{ break-inside: auto; }}
+        td p {{ margin: 0; line-height: {self.options.cell_line_height}; }}
+        .footnotes, .endnotes {{ column-span: all; border-top: 0.5pt solid #777;
+                                margin-top: 8pt; font-size: 0.85em; }}
+        .textbox {{ display: inline-block; border: 0.5pt solid #999; padding: 2pt; }}
+        .equation {{ font-family: serif; font-style: italic; }}
         .pageno::after {{ content: counter(page); }}
         """
         # Metadatos del documento -> <title>/<meta> que WeasyPrint vuelca al PDF.
@@ -1102,104 +989,61 @@ class Converter:
             "<!DOCTYPE html><html><head><meta charset='utf-8'>"
             + head_meta + "<style>"
             + page_css + "</style></head><body>"
-            + "".join(divs) + "".join(blocks)
+            + "".join(divs) + '<main class="document">' + "".join(blocks)
+            + notes + endnotes + "</main>"
             + "</body></html>"
         )
 
 
-# Alias aceptados para cada motor de conversión.
-_ENGINE_ALIASES = {
-    "auto": "auto",
-    "word": "word", "msword": "word",
-    "libreoffice": "libreoffice", "soffice": "libreoffice", "lo": "libreoffice",
-    "weasyprint": "weasyprint", "flow": "weasyprint", "python": "weasyprint",
-}
-
-
-def _convert_weasyprint(in_path: str, out_path: str) -> str:
+def _convert_weasyprint(
+    in_path: Pathish, out_path: Pathish, options: Optional[ConversionOptions] = None
+) -> str:
     """Native flow: OOXML -> HTML -> PDF via WeasyPrint (approximate pagination)."""
-    # Deferred import: the package (and build_html) can be used without
-    # WeasyPrint — and its native libraries — being installed.
-    from weasyprint import HTML
-
-    with Converter(in_path) as conv:
-        html = conv.build_html()
-
-    def _render() -> None:
-        HTML(string=html).write_pdf(out_path)
-
-    if _WEASYPRINT_TIMEOUT > 0:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(_render)
-            try:
-                future.result(timeout=_WEASYPRINT_TIMEOUT)
-            except concurrent.futures.TimeoutError as exc:
-                raise TimeoutError(
-                    f"WeasyPrint timed out after {_WEASYPRINT_TIMEOUT}s"
-                ) from exc
-    else:
-        _render()
-
-    return out_path
-
-
-def convert(in_path: str, out_path: str, engine: str = "auto") -> str:
-    """Convert ``in_path`` (.docx) to ``out_path`` (.pdf). Returns out_path.
-
-    ``engine`` selects the layout engine:
-
-    - ``"auto"`` (default): uses Microsoft Word or LibreOffice when available
-      — faithful pagination, same page breaks as the original — and falls back
-      to the lxml + WeasyPrint flow otherwise.
-    - ``"word"`` / ``"libreoffice"`` / ``"weasyprint"``: forces that engine
-      (raises if the chosen engine is not available).
-    """
-    from . import engines
-
-    key = _ENGINE_ALIASES.get((engine or "auto").lower())
-    if key is None:
-        raise ValueError(
-            f"unknown engine: {engine!r} (use auto/word/libreoffice/weasyprint)"
-        )
-
-    if not os.path.exists(in_path):
-        raise FileNotFoundError(f"input file not found: {in_path}")
-    if not zipfile.is_zipfile(in_path):
-        raise ValueError(
-            f"file is not a valid .docx (not a ZIP/OOXML): {in_path}"
-        )
-
-    if key == "auto":
-        # Try real layout engines in order; degrade to WeasyPrint on failure.
-        attempts = (
-            ("word", engines.word_available, engines.convert_word),
-            ("libreoffice", lambda: bool(engines.find_libreoffice()),
-             engines.convert_libreoffice),
-        )
-        for label, ready, run in attempts:
-            if ready():
-                try:
-                    return run(in_path, out_path)
-                except Exception as exc:  # noqa: BLE001 — degrade with warning
-                    sys.stderr.write(
-                        f"[docx2pdf-py] engine '{label}' failed ({exc}); "
-                        "trying next\n"
-                    )
-        return _convert_weasyprint(in_path, out_path)
-
-    if key == "word":
-        if not engines.word_available():
-            raise RuntimeError(
-                "Word engine requested but not available "
-                "(requires Windows or macOS with Word installed)"
+    # Rendering runs outside this process so a timeout can terminate native
+    # WeasyPrint/Pango work rather than leaving a background thread alive.
+    options = options or ConversionOptions.from_environment()
+    with tempfile.TemporaryDirectory() as tmp:
+        assets = Path(tmp) / "assets"
+        with Converter(in_path, options=options, asset_directory=assets) as conv:
+            html = conv.build_html()
+        html_path = Path(tmp) / "document.html"
+        rendered_path = Path(tmp) / "document.pdf"
+        html_path.write_text(html, encoding="utf-8")
+        command = [sys.executable, "-m", "docx2pdf_py._weasy_worker",
+                   str(html_path), str(rendered_path)]
+        try:
+            process = run_process(command, timeout=options.weasyprint_timeout or None)
+        except subprocess.TimeoutExpired as exc:
+            raise ConversionTimeoutError(
+                f"WeasyPrint timed out after {options.weasyprint_timeout}s"
+            ) from exc
+        if process.returncode != 0:
+            detail = (process.stderr or process.stdout).decode(errors="replace").strip()
+            raise ConversionError(
+                "WeasyPrint failed to render the document" + (f": {detail}" if detail else "")
             )
-        return engines.convert_word(in_path, out_path)
+        return publish_pdf(rendered_path, out_path)
 
-    if key == "libreoffice":
-        if not engines.find_libreoffice():
-            raise RuntimeError(
-                "LibreOffice engine requested but 'soffice' was not found on this system"
-            )
-        return engines.convert_libreoffice(in_path, out_path)
 
-    return _convert_weasyprint(in_path, out_path)
+def convert_detailed(
+    in_path: Pathish,
+    out_path: Pathish,
+    engine: Engine = "auto",
+    options: Optional[ConversionOptions] = None,
+) -> ConversionResult:
+    """Compatibility import for callers using ``docx2pdf_py.converter``."""
+    from .api import convert_detailed as _convert_detailed
+
+    return _convert_detailed(in_path, out_path, engine=engine, options=options)
+
+
+def convert(
+    in_path: Pathish,
+    out_path: Pathish,
+    engine: Engine = "auto",
+    options: Optional[ConversionOptions] = None,
+) -> str:
+    """Compatibility import for callers using ``docx2pdf_py.converter``."""
+    from .api import convert as _convert
+
+    return _convert(in_path, out_path, engine=engine, options=options)

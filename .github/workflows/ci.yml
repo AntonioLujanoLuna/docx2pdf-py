@@ -9,12 +9,12 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
       - name: Install lint tools
-        run: pip install ruff bandit mypy lxml lxml-stubs
+        run: pip install ruff bandit "mypy<2" lxml lxml-stubs
       - name: Lint (ruff)
         run: ruff check .
       - name: Security scan (bandit)
@@ -28,27 +28,27 @@ jobs:
       matrix:
         python-version: ["3.9", "3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python-version }}
       # Tests exercise build_html (OOXML -> HTML) and only need lxml;
       # WeasyPrint (and its native libraries) is not required for the suite.
       - name: Install test deps
-        run: pip install lxml pytest pytest-cov
+        run: pip install --no-deps -e . && pip install lxml pytest pytest-cov
       - name: Run tests with coverage
-        run: python -m pytest -q --cov=docx2pdf_py --cov-report=term-missing --cov-fail-under=70
+        run: python -m pytest -q --cov=docx2pdf_py --cov-report=term-missing --cov-fail-under=80
 
   engines-macos:
     # Verify engine detection works on macOS (Word/LibreOffice path logic).
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
       - name: Install test deps
-        run: pip install lxml pytest
+        run: pip install --no-deps -e . && pip install lxml pytest
       - name: Run engine-detection tests
         run: python -m pytest tests/test_engines.py -q
 
@@ -57,8 +57,8 @@ jobs:
     # 'auto' mode when Word is absent): verifies that a valid PDF is produced.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
       - name: Install LibreOffice
@@ -66,6 +66,43 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libreoffice-writer
       - name: Install package
-        run: pip install lxml -e .
+        run: pip install lxml pypdf pymupdf -e .
       - name: Convert a sample .docx and check the PDF
-        run: python tests/e2e_smoke.py
+        run: |
+          python tests/e2e_smoke.py
+          python tests/e2e_fidelity.py
+
+  e2e-weasyprint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install native rendering libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpango-1.0-0 libharfbuzz0b libpangoft2-1.0-0
+      - name: Install package
+        run: pip install pypdf pymupdf -e .
+      - name: Convert with WeasyPrint and verify page text
+        run: |
+          E2E_ENGINE=weasyprint python tests/e2e_smoke.py
+          E2E_ENGINE=weasyprint python tests/e2e_fidelity.py
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Build and validate wheel
+        run: |
+          pip install build twine
+          python -m build
+          python -m twine check dist/*
+          pip install --force-reinstall dist/*.whl
+          python -c "import docx2pdf_py; assert docx2pdf_py.__version__ == '0.1.0'"
+          python -c "from importlib.resources import files; assert files('docx2pdf_py').joinpath('py.typed').is_file()"
+          docx2pdf-py --version

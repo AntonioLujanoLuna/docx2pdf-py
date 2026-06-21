@@ -1,15 +1,20 @@
 """Command-line interface: docx2pdf-py input.docx [output.pdf]"""
+from __future__ import annotations
+
 import argparse
 import glob
 import os
 import sys
+from collections.abc import Sequence
+from dataclasses import replace
 
 from . import __version__
-from .converter import convert
-from .engines import default_engine
+from .converter import convert_detailed
+from .exceptions import Docx2PdfError
+from .models import ConversionOptions
 
 
-def main(argv=None):
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="docx2pdf-py",
         description="Convert a .docx file to PDF using pure Python libraries.",
@@ -46,6 +51,11 @@ def main(argv=None):
         help="suppress all output on success",
     )
     parser.add_argument(
+        "--fallback",
+        choices=["always", "unavailable-only", "never"],
+        help="fallback policy for auto engine selection",
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="show additional details during conversion",
@@ -67,17 +77,34 @@ def main(argv=None):
     if os.path.exists(args.output) and not args.force:
         parser.error(f"output already exists: {args.output} (use -f to overwrite)")
 
-    used = args.engine if args.engine != "auto" else f"auto ({default_engine()})"
-
     if args.verbose and not args.quiet:
         print(f"Input:  {src}")
         print(f"Output: {args.output}")
-        print(f"Engine: {used}")
+        print(f"Requested engine: {args.engine}")
 
-    convert(src, args.output, engine=args.engine)
+    try:
+        options = ConversionOptions.from_environment()
+        if args.fallback:
+            options = replace(options, fallback=args.fallback)
+        result = convert_detailed(src, args.output, engine=args.engine, options=options)
+    except (Docx2PdfError, OSError) as exc:
+        parser.error(str(exc))
 
     if not args.quiet:
-        print(f"✓ {src} -> {args.output}  [engine: {used}]")
+        for warning in result.warnings:
+            print(f"[docx2pdf-py] {warning}", file=sys.stderr)
+        print(f"OK {src} -> {args.output}  [engine: {result.engine}]")
+        if args.verbose:
+            print(
+                f"Elapsed: {result.elapsed_seconds:.3f}s | "
+                f"Pages: {result.page_count or 'unknown'} | "
+                f"Output: {result.output_bytes} bytes"
+            )
+            for attempt in result.attempts:
+                status = attempt.error or ("available" if attempt.available else "unavailable")
+                print(
+                    f"Attempt: {attempt.engine} | {attempt.elapsed_seconds:.3f}s | {status}"
+                )
 
     return 0
 

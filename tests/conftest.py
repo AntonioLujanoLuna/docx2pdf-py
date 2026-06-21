@@ -9,6 +9,10 @@ NS = (
 )
 
 MINIMAL_STYLES = f'<w:styles {NS}></w:styles>'
+FAKE_PDF = (
+    b"%PDF-1.4\n1 0 obj <</Type /Page>> endobj\n"
+    b"startxref\n0\n%%EOF\n"
+)
 
 # Namespace URIs used in full OOXML package boilerplate.
 _PKG = "http://schemas.openxmlformats.org/package/2006"

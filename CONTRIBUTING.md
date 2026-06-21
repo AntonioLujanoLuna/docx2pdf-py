@@ -37,6 +37,11 @@ python -m pytest --cov=docx2pdf_py --cov-report=term-missing
 
 # Full end-to-end test (requires LibreOffice)
 python tests/e2e_smoke.py
+python tests/e2e_fidelity.py
+
+# Build the artifacts exactly as the release workflow does
+python -m build
+python -m twine check dist/*
 ```
 
 ## Lint and type checks
@@ -54,14 +59,22 @@ bandit -r docx2pdf_py/    # security scan
 - **Error messages**: in English. All user-facing strings must be English.
 - **Type hints**: add return type annotations to new public functions. The package ships `py.typed`.
 - **Tests**: every new feature or bug fix must include a test. Tests that exercise the Converter do not require WeasyPrint — build synthetic `.docx` files in memory using the `make_docx` or `make_full_docx` fixtures in `tests/conftest.py`.
+- **CLI and engine changes**: test the reported engine, exit status, timeout behavior, and preservation of an existing output on failure.
 - **Security**: never use `shell=True` in subprocess calls; never expand untrusted content into commands.
 
 ## Project structure
 
 ```
 docx2pdf_py/
-  converter.py   # OOXML -> HTML (core logic, ~1 200 LOC)
+  converter.py   # OOXML traversal and HTML/CSS assembly
+  api.py         # Engine orchestration, diagnostics, and batch conversion
+  ooxml.py       # Hardened package reader and namespace helpers
+  formatting.py  # Pure formatting and numbering helpers
+  backends.py    # Built-in ConversionEngine implementations
   engines.py     # Word / LibreOffice / WeasyPrint backends
+  models.py      # Typed options and detailed conversion results
+  output.py      # PDF validation and atomic publication
+  exceptions.py  # Public package-specific exceptions
   cli.py         # Command-line interface
   __init__.py    # Public API exports
 tests/

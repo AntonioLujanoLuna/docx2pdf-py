@@ -41,6 +41,33 @@ from docx2pdf_py import convert
 convert("entrada.docx", "salida.pdf")
 ```
 
+Para conocer el motor que terminó la conversión y los fallos recuperables de
+`auto`, usa la API detallada:
+
+```python
+from docx2pdf_py import ConversionOptions, convert_detailed
+
+result = convert_detailed(
+    "entrada.docx",
+    "salida.pdf",
+    options=ConversionOptions(weasyprint_timeout=60, respect_page_hints=False),
+)
+print(result.engine, result.warnings)
+print(result.page_count, result.elapsed_seconds, result.attempts)
+```
+
+La política de fallback puede ser `always` (predeterminada),
+`unavailable-only` o `never`. Para lotes hay una API concurrente, acotada y
+cancelable:
+
+```python
+from docx2pdf_py import convert_batch
+
+items = convert_batch(["a.docx", "b.docx"], "pdfs", max_workers=2)
+for item in items:
+    print(item.input_path, item.result or item.error)
+```
+
 Como comando:
 
 ```bash
@@ -63,6 +90,9 @@ equivalente Unicode), tablas (bordes, sombreados, celdas combinadas horizontal
 toma del `sectPr`. Los campos de Word (p. ej. `PAGE`) se interpretan, no se
 vuelca su valor cacheado. Los **metadatos** del documento (título, autor, asunto,
 palabras clave de `docProps/core.xml`) se trasladan a los del PDF.
+También reproduce overrides y reinicios de numeración, notas al pie y finales,
+texto insertado por cambios controlados, cuadros de texto, ecuaciones textuales,
+documentos multicolumna, geometría por sección y cabeceras de tabla repetibles.
 
 Resuelve además las **fuentes de tema** (`asciiTheme`, p. ej. `minorHAnsi` →
 Calibri) leyéndolas de `theme1.xml`, y la **herencia de estilos**: cada estilo
@@ -101,6 +131,7 @@ print(default_engine())                                   # qué usaría 'auto' 
 
 ```bash
 docx2pdf-py entrada.docx salida.pdf --engine libreoffice
+docx2pdf-py entrada.docx salida.pdf --fallback unavailable-only
 ```
 
 Se puede forzar la ruta de LibreOffice con la variable `SOFFICE_BIN`.
@@ -117,8 +148,10 @@ es aproximada, pero se acerca lo posible a la de Word:
 
 ## Limitaciones (conversor ligero, no un motor Word completo)
 
-- **Listas numeradas**: se renderiza el formato del nivel, pero no se aplican
-  reinicios/overrides explícitos (`lvlOverride`, `startOverride`).
+- **Gráficos y objetos incrustados**: cuando no existe una previsualización de
+  imagen se conserva un marcador accesible, no el gráfico editable.
+- **Cambios controlados**: se muestra el texto insertado y se oculta el eliminado;
+  no se reproducen globos, autores ni fechas de revisión.
 - **Fuentes**: mapea Calibri→Carlito y Georgia→Gelasio (incl. las referidas por
   tema vía `asciiTheme`); el resto usa la fuente real si está instalada y, si no,
   cae en su familia genérica (serif/sans/monospace).
@@ -134,6 +167,11 @@ es aproximada, pero se acerca lo posible a la de Word:
 Un `.docx` es entrada potencialmente no confiable. El parseo del OOXML usa un
 parser de `lxml` endurecido (sin resolución de entidades — evita XXE y *billion
 laughs* — ni acceso a red) y hay topes defensivos frente a *zip bombs*.
+También se limita el número de elementos XML y se normalizan los destinos de
+relaciones OOXML.
+Los motores generan primero un PDF temporal, validan su cabecera y solo entonces
+reemplazan la salida de forma atómica. Word, LibreOffice y WeasyPrint se ejecutan
+con límites de tiempo configurables.
 
 ## Desarrollo
 
@@ -141,6 +179,8 @@ laughs* — ni acceso a red) y hay topes defensivos frente a *zip bombs*.
 pip install -e .[dev]   # instala también pytest y ruff
 pytest                  # los tests cubren build_html (OOXML -> HTML), sin WeasyPrint
 ruff check .            # linter (mismo chequeo que ejecuta CI)
+mypy docx2pdf_py         # tipos de la API y los backends
+python -m build          # sdist + wheel
 ```
 
 La CI ejecuta, además, un *smoke test* de extremo a extremo
@@ -151,8 +191,18 @@ La CI ejecuta, además, un *smoke test* de extremo a extremo
 ```
 docx2pdf_py/
   __init__.py     → expone convert(), Converter, default_engine()
-  converter.py    → conversor OOXML -> HTML -> PDF (flujo propio) + dispatch de motor
+  converter.py    → recorrido del documento OOXML y ensamblado HTML/CSS
+  api.py          → selección de motores, fallback, diagnósticos y lotes
+  backends.py     → adaptadores del protocolo de motores
+  engine_protocol.py → interfaz extensible para motores externos
+  ooxml.py        → lectura segura del paquete y utilidades OOXML
+  formatting.py   → numeración, fuentes, propiedades de texto y CSS
   engines.py      → backends Word / LibreOffice y detección del motor
+  models.py       → opciones tipadas y resultado detallado
+  output.py       → validación y publicación atómica del PDF
+  exceptions.py   → jerarquía pública de errores
+  _*_worker.py    → procesos aislados y terminables para Word/WeasyPrint
+  processes.py    → ejecución y terminación del árbol de procesos
   cli.py          → comando docx2pdf-py (incluye --engine)
 tests/            → suite de pytest (no requiere WeasyPrint) + e2e_smoke.py
 .github/workflows → CI (lint con ruff, pytest en varias versiones, e2e LibreOffice)

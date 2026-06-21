@@ -6,6 +6,24 @@ El formato sigue, a grandes rasgos, [Keep a Changelog](https://keepachangelog.co
 ## [Sin publicar]
 
 ### Añadido
+- Protocolo extensible de motores, políticas explícitas de fallback y API de
+  conversión por lotes con concurrencia acotada, cancelación y nombres seguros.
+- Diagnósticos por conversión: intentos, errores, tiempos, tamaños y páginas.
+- Soporte del flujo propio para overrides de numeración, notas al pie/finales,
+  revisiones, cuadros de texto, ecuaciones, columnas y secciones con geometría
+  propia, cabeceras de tabla repetibles y filas no divisibles.
+- Corpus E2E generado con texto esperado por página y comprobación raster.
+- Límites de elementos XML, validación estructural de PDF y terminación de
+  árboles de procesos.
+- API `convert_detailed()` con el motor realmente usado, avisos de fallback y
+  opciones tipadas por conversión mediante `ConversionOptions`.
+- Jerarquía pública de excepciones para documentos inválidos, motores no
+  disponibles, errores de conversión y timeouts.
+- Publicación atómica y validación de PDFs para todos los motores.
+- Procesos terminables para WeasyPrint y la automatización de Word en Windows.
+- Tests de CLI, empaquetado, timeouts, fallback y preservación de salidas.
+- Automatización de dependencias, validación de wheel y publicación a PyPI con
+  identidad federada en CI.
 - **Resaltado de texto** (`w:highlight`): se reproduce con `background-color`,
   mapeando los colores con nombre de Word (yellow, green, cyan…).
 - **Mayúsculas y versalitas** (`w:caps` / `w:smallCaps`) → `text-transform` /
@@ -24,6 +42,10 @@ El formato sigue, a grandes rasgos, [Keep a Changelog](https://keepachangelog.co
   (`tests/e2e_smoke.py`) que convierte un `.docx` real a PDF con LibreOffice.
 
 ### Cambiado
+- El renderizado WeasyPrint extrae imágenes a recursos temporales locales para
+  evitar inflar el HTML y duplicar memoria mediante base64.
+- El conversor monolítico se divide en módulos de API, backends, OOXML,
+  formato, procesos y publicación de salida.
 - `pyproject.toml`: configuración de ruff y `ruff` añadido a las dependencias de
   desarrollo; metadatos de autoría corregidos.
 

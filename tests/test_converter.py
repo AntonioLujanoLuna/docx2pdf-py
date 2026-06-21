@@ -1,6 +1,7 @@
 """Tests de docx2pdf_py centrados en build_html (no requieren WeasyPrint)."""
 import pytest
 
+from docx2pdf_py import ConversionOptions
 from docx2pdf_py import converter as C
 from docx2pdf_py.converter import Converter, font_stack
 from tests.conftest import NS, document
@@ -92,11 +93,11 @@ def test_page_hint_not_on_first_block(make_docx):
     assert "break-before:page" not in html
 
 
-def test_page_hint_can_be_disabled(make_docx, monkeypatch):
-    monkeypatch.setattr(C, "RESPECT_PAGE_HINTS", False)
+def test_page_hint_can_be_disabled(make_docx):
     body = ("<w:p><w:r><w:t>uno</w:t></w:r></w:p>"
             "<w:p><w:r><w:lastRenderedPageBreak/><w:t>dos</w:t></w:r></w:p>")
-    with Converter(make_docx(document(body))) as conv:
+    options = ConversionOptions(respect_page_hints=False)
+    with Converter(make_docx(document(body)), options=options) as conv:
         html = conv.build_html()
     assert "break-before:page" not in html
 
